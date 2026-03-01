@@ -2,6 +2,7 @@ package deadletter
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,6 +148,55 @@ func TestFileStore_AutoCreateDir(t *testing.T) {
 	files, _ := os.ReadDir(dir)
 	if len(files) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+}
+
+func TestFileStore_ConcurrentSaves(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewFileStore(dir, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 20
+	errs := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			errs <- store.Save(Entry{
+				RequestID:   fmt.Sprintf("req-concurrent-%d", i),
+				Timestamp:   time.Now().UTC(),
+				RoutePath:   "/hooks/test",
+				RequestBody: []byte(fmt.Sprintf(`{"i":%d}`, i)),
+				ErrorMessage: "test error",
+			})
+		}(i)
+	}
+
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("save %d failed: %v", i, err)
+		}
+	}
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != n {
+		t.Errorf("files = %d, want %d", len(files), n)
+	}
+
+	// Every file should be valid JSON.
+	for _, f := range files {
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entry Entry
+		if err := json.Unmarshal(data, &entry); err != nil {
+			t.Errorf("file %s: invalid JSON: %v", f.Name(), err)
+		}
 	}
 }
 

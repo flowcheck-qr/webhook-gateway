@@ -1,30 +1,31 @@
 # Webhook Gateway configuration
 #
-# Secrets are read from environment variables (secret_env), never inline.
-# Durations use Go syntax: "10s", "1m", "24h".
+# Secrets are always read from environment variables (secret_env), so this
+# file is safe to commit. Durations use Go syntax: "10s", "1m", "24h".
 
 server:
   port: 8080
   read_timeout: 30s
   write_timeout: 30s
-  max_body_size: 1048576        # 1MB — cap inbound payload size
+  max_body_size: 1048576        # 1MB — reject payloads larger than this
   concurrency_limit: 100        # max in-flight destination deliveries (0 = unlimited)
 
 routes:
+
+  # ── GitHub ──────────────────────────────────────────────────────────
+  # Fan-out: push events go to both the deploy service and Slack.
+  # GitHub signs with HMAC-SHA256, header value prefixed with "sha256=".
   - path: /hooks/github
     signature:
       type: hmac-sha256
       header: X-Hub-Signature-256
       secret_env: GITHUB_WEBHOOK_SECRET
-      prefix: "sha256="         # stripped before hex-decoding the signature
-      encoding: hex             # hex (default) — how the signature is encoded
+      prefix: "sha256="
     destinations:
-      - url: https://service-a.example.com/webhook
+      - url: https://deploy.example.com/webhook
         timeout: 10s
-      - url: https://service-b.example.com/webhook
+      - url: https://slack-bridge.example.com/github
         timeout: 5s
-    # Headers to forward beyond Content-Type and X-Webhook-Gateway-Request-Id.
-    # Hop-by-hop headers and Host are never forwarded.
     forward_headers:
       - X-GitHub-Event
       - X-GitHub-Delivery
@@ -34,20 +35,20 @@ routes:
       initial_interval: 1s
       max_interval: 30s
 
+  # ── Stripe ──────────────────────────────────────────────────────────
+  # Single destination with deduplication. Stripe retries aggressively,
+  # so idempotency prevents your billing service from processing the
+  # same invoice.paid event twice.
   - path: /hooks/stripe
     signature:
-      type: stripe              # uses StripeVerifier, NOT generic HMAC
+      type: stripe
       header: Stripe-Signature
       secret_env: STRIPE_WEBHOOK_SECRET
-      tolerance: 300s           # reject events older than 5 minutes
+      tolerance: 300s           # reject replayed events older than 5 min
     idempotency:
       enabled: true
-      ttl: 24h                  # how long to remember event IDs
-      # Dot-separated object path to the unique event ID in the JSON body.
-      # Example: "id" extracts $.id, "data.object.id" extracts $.data.object.id.
-      # Arrays are not supported. If the path is missing or the body is not
-      # valid JSON, deduplication is skipped and delivery proceeds normally.
-      key_path: id
+      ttl: 24h
+      key_path: id              # extracts "evt_..." from the JSON body
     destinations:
       - url: https://billing.example.com/webhook
         timeout: 10s
@@ -59,6 +60,50 @@ routes:
       initial_interval: 2s
       max_interval: 60s
 
+  # ── GitLab ──────────────────────────────────────────────────────────
+  # Single destination, minimal config. GitLab uses a plain HMAC-SHA256
+  # header with no prefix.
+  - path: /hooks/gitlab
+    signature:
+      type: hmac-sha256
+      header: X-Gitlab-Token
+      secret_env: GITLAB_WEBHOOK_SECRET
+    destinations:
+      - url: https://ci.example.com/webhook
+        timeout: 10s
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      initial_interval: 1s
+      max_interval: 30s
+
+  # ── Internal service ────────────────────────────────────────────────
+  # Fan-out to three services with deduplication on a nested key.
+  # Shows that key_path supports dot-separated paths into the JSON body.
+  - path: /hooks/orders
+    signature:
+      type: hmac-sha256
+      header: X-Signature
+      secret_env: ORDERS_WEBHOOK_SECRET
+    idempotency:
+      enabled: true
+      ttl: 12h
+      key_path: data.order.id   # nested path — extracts $.data.order.id
+    destinations:
+      - url: https://inventory.example.com/webhook
+        timeout: 10s
+      - url: https://shipping.example.com/webhook
+        timeout: 10s
+      - url: https://analytics.example.com/events
+        timeout: 5s
+    forward_headers:
+      - X-Event-Type
+    retry:
+      max_attempts: 4
+      backoff: exponential
+      initial_interval: 500ms
+      max_interval: 15s
+
 dead_letter:
   type: file
   path: ./dead_letters
@@ -66,5 +111,5 @@ dead_letter:
   max_body_bytes: 1048576       # truncate stored body to this size (0 = no limit)
 
 logging:
-  level: info
-  format: json
+  level: info                   # debug, info, warn, error
+  format: json                  # json or text

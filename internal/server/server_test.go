@@ -87,6 +87,54 @@ func TestServer_MaxBodySize_413(t *testing.T) {
 	}
 }
 
+func TestServer_MaxBodySize_ExactLimit(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write(body)
+	})
+
+	srv := New(Config{
+		Port:         0,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		MaxBodySize:  10,
+	}, handler, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	go srv.Serve(ln)
+	defer srv.Shutdown(context.Background())
+
+	// Exactly at limit — should succeed.
+	resp, err := http.Post(fmt.Sprintf("http://%s/", addr), "text/plain", strings.NewReader("0123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("exact limit: status = %d, want 200", resp.StatusCode)
+	}
+
+	// One byte over — should fail.
+	resp2, err := http.Post(fmt.Sprintf("http://%s/", addr), "text/plain", strings.NewReader("01234567890"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 413 {
+		t.Fatalf("over limit: status = %d, want 413", resp2.StatusCode)
+	}
+}
+
 func TestServer_GracefulShutdown(t *testing.T) {
 	requestStarted := make(chan struct{})
 	requestDone := make(chan struct{})

@@ -493,6 +493,180 @@ func TestRouter_StripeRoute(t *testing.T) {
 	}
 }
 
+func TestRouter_MixedDestinations_PartialFailure(t *testing.T) {
+	var mu sync.Mutex
+	var dest1Got, dest2Got, dest3Got bool
+
+	// dest1: succeeds
+	dest1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dest1Got = true
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer dest1.Close()
+
+	// dest2: returns 500 (retryable, but max_attempts=1 so goes to DLQ)
+	dest2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dest2Got = true
+		mu.Unlock()
+		w.WriteHeader(500)
+	}))
+	defer dest2.Close()
+
+	// dest3: succeeds
+	dest3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dest3Got = true
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer dest3.Close()
+
+	secret := "secret"
+	router, dlq := newTestRouter(t, []string{dest1.URL, dest2.URL, dest3.URL}, secret)
+	gw := httptest.NewServer(router)
+	defer gw.Close()
+
+	body := []byte(`{"event":"mixed"}`)
+	sig := sign(secret, body)
+
+	req, _ := http.NewRequest("POST", gw.URL+"/hooks/test", strings.NewReader(string(body)))
+	req.Header.Set("X-Signature", sig)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Wait for all three destinations to be hit.
+	waitForDeliveries(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return dest1Got && dest2Got && dest3Got
+	})
+
+	// Only dest2 should produce a DLQ entry.
+	waitForDeliveries(t, func() bool {
+		return len(dlq.Entries()) > 0
+	})
+
+	entries := dlq.Entries()
+	if len(entries) != 1 {
+		t.Fatalf("dlq entries = %d, want 1", len(entries))
+	}
+	if entries[0].DestinationURL != dest2.URL {
+		t.Errorf("dlq destination = %q, want %q", entries[0].DestinationURL, dest2.URL)
+	}
+}
+
+func TestRouter_AllDestinationsFail(t *testing.T) {
+	dest1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(502)
+	}))
+	defer dest1.Close()
+
+	dest2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+	}))
+	defer dest2.Close()
+
+	secret := "secret"
+	router, dlq := newTestRouter(t, []string{dest1.URL, dest2.URL}, secret)
+	gw := httptest.NewServer(router)
+	defer gw.Close()
+
+	body := []byte(`{"event":"allfail"}`)
+	sig := sign(secret, body)
+
+	req, _ := http.NewRequest("POST", gw.URL+"/hooks/test", strings.NewReader(string(body)))
+	req.Header.Set("X-Signature", sig)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (async)", resp.StatusCode)
+	}
+
+	// Both destinations should produce DLQ entries.
+	waitForDeliveries(t, func() bool {
+		return len(dlq.Entries()) >= 2
+	})
+
+	entries := dlq.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("dlq entries = %d, want 2", len(entries))
+	}
+
+	urls := map[string]bool{}
+	for _, e := range entries {
+		urls[e.DestinationURL] = true
+	}
+	if !urls[dest1.URL] || !urls[dest2.URL] {
+		t.Errorf("expected DLQ entries for both destinations, got %v", urls)
+	}
+}
+
+func TestRouter_ConcurrencyLimit(t *testing.T) {
+	var mu sync.Mutex
+	concurrent := 0
+	maxConcurrent := 0
+
+	// Each destination sleeps briefly so we can observe concurrency.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		concurrent++
+		if concurrent > maxConcurrent {
+			maxConcurrent = concurrent
+		}
+		mu.Unlock()
+
+		time.Sleep(50 * time.Millisecond)
+
+		mu.Lock()
+		concurrent--
+		mu.Unlock()
+
+		w.WriteHeader(200)
+	})
+
+	// 4 destination servers.
+	var destURLs []string
+	for i := 0; i < 4; i++ {
+		srv := httptest.NewServer(handler)
+		defer srv.Close()
+		destURLs = append(destURLs, srv.URL)
+	}
+
+	secret := "secret"
+	router, _ := newTestRouter(t, destURLs, secret, func(cfg *config.Config) {
+		cfg.Server.ConcurrencyLimit = 2 // only 2 concurrent deliveries allowed
+	})
+	gw := httptest.NewServer(router)
+	defer gw.Close()
+
+	body := []byte(`{"event":"concurrent"}`)
+	sig := sign(secret, body)
+
+	req, _ := http.NewRequest("POST", gw.URL+"/hooks/test", strings.NewReader(string(body)))
+	req.Header.Set("X-Signature", sig)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Wait for all 4 deliveries to complete.
+	waitForDeliveries(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return concurrent == 0 && maxConcurrent > 0
+	})
+
+	mu.Lock()
+	if maxConcurrent > 2 {
+		t.Errorf("max concurrent deliveries = %d, want <= 2 (concurrency limit)", maxConcurrent)
+	}
+	mu.Unlock()
+}
+
 // waitForDeliveries polls a condition with a timeout, since fan-out is async.
 func waitForDeliveries(t *testing.T, cond func() bool) {
 	t.Helper()

@@ -94,3 +94,10 @@ func TestHMACVerifier_InvalidHex(t *testing.T) {
 		t.Fatal("expected error for invalid hex")
 	}
 }
+
+func TestHMACVerifier_UnsupportedEncoding(t *testing.T) {
+	v := &HMACVerifier{Encoding: "base64"}
+	if err := v.Verify("dGVzdA==", "secret", []byte("body")); err == nil {
+		t.Fatal("expected error for unsupported encoding")
+	}
+}
