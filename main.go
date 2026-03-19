@@ -58,7 +58,7 @@ func main() {
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		MaxBodySize:  cfg.Server.MaxBodySize,
-	}, r, r)
+	}, r, r, r.Stats)
 
 	if err := srv.ListenAndServe(30 * time.Second); err != nil {
 		slog.Error("server error", "error", err)

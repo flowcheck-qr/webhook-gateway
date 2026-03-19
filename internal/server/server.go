@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/ryanmoreau/webhook-gateway/internal/stats"
 )
 
 // Config holds HTTP server settings.
@@ -32,14 +35,26 @@ type Server struct {
 }
 
 // New creates a Server that limits request body size and delegates to handler.
-func New(cfg Config, handler http.Handler, drainer WaitDrainer) *Server {
+func New(cfg Config, handler http.Handler, drainer WaitDrainer, counters *stats.Counters) *Server {
 	maxBody := cfg.MaxBodySize
 	if maxBody <= 0 {
 		maxBody = 1 << 20
 	}
 
-	// Wrap handler with body size limit.
-	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	// Health endpoint returns JSON stats — no dependencies, works for anyone.
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		snap := counters.Snapshot()
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"stats":  snap,
+		})
+	})
+
+	// All other requests go to the webhook router with body size limit.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 		handler.ServeHTTP(w, r)
 	})
@@ -47,7 +62,7 @@ func New(cfg Config, handler http.Handler, drainer WaitDrainer) *Server {
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         fmt.Sprintf(":%d", cfg.Port),
-			Handler:      wrapped,
+			Handler:      mux,
 			ReadTimeout:  cfg.ReadTimeout,
 			WriteTimeout: cfg.WriteTimeout,
 		},

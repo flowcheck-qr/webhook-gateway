@@ -18,6 +18,7 @@ import (
 	"github.com/ryanmoreau/webhook-gateway/internal/idempotency"
 	"github.com/ryanmoreau/webhook-gateway/internal/logging"
 	"github.com/ryanmoreau/webhook-gateway/internal/signature"
+	"github.com/ryanmoreau/webhook-gateway/internal/stats"
 )
 
 // hopByHopHeaders are headers that must not be forwarded to destinations.
@@ -38,6 +39,7 @@ type Router struct {
 	routes     []routeEntry
 	dlq        deadletter.Store
 	idem       idempotency.Store
+	Stats      *stats.Counters
 	inFlight   sync.WaitGroup
 	sem        chan struct{} // concurrency limiter; nil if unlimited
 }
@@ -51,8 +53,9 @@ type routeEntry struct {
 // New creates a Router from the loaded config.
 func New(cfg *config.Config, dlq deadletter.Store, idem idempotency.Store) *Router {
 	r := &Router{
-		dlq:  dlq,
-		idem: idem,
+		dlq:   dlq,
+		idem:  idem,
+		Stats: stats.New(),
 	}
 
 	if cfg.Server.ConcurrencyLimit > 0 {
@@ -125,9 +128,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	r.Stats.RequestsReceived.Add(1)
+
 	// Verify signature.
 	sigHeader := req.Header.Get(matched.cfg.Signature.Header)
 	if err := matched.verifier.Verify(sigHeader, matched.secret, body); err != nil {
+		r.Stats.SignatureFailures.Add(1)
 		logger.Warn("signature verification failed", "error", err)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -142,6 +148,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				logger.Warn("idempotency check failed", "error", err)
 				// Continue delivery on error — don't block on dedup failures.
 			} else if seen {
+				r.Stats.DuplicatesSkipped.Add(1)
 				logger.Info("duplicate event, skipping delivery", "event_id", eventID)
 				w.WriteHeader(http.StatusOK)
 				return
@@ -161,8 +168,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Fan out to all destinations concurrently.
 	route := matched // capture for goroutine
 	r.inFlight.Add(1)
+	r.Stats.InFlight.Add(1)
 	go func() {
 		defer r.inFlight.Done()
+		defer r.Stats.InFlight.Add(-1)
 		r.fanOut(ctx, logger, route, fwdHeaders, body, reqID)
 	}()
 }
@@ -194,10 +203,12 @@ func (r *Router) fanOut(ctx context.Context, logger *slog.Logger, route *routeEn
 				defer func() { <-r.sem }()
 			}
 
+			r.Stats.DeliveriesAttempted.Add(1)
 			err := delivery.WithRetry(ctx, retryCfg, func() error {
 				return delivery.Deliver(ctx, dest, headers, body)
 			})
 			if err != nil {
+				r.Stats.DeliveriesFailed.Add(1)
 				logger.Error("delivery failed",
 					"destination", dest.URL,
 					"error", err,
@@ -213,10 +224,12 @@ func (r *Router) fanOut(ctx context.Context, logger *slog.Logger, route *routeEn
 					ErrorMessage:   err.Error(),
 					AttemptCount:   retryCfg.MaxAttempts,
 				}
+				r.Stats.DeadLettersWritten.Add(1)
 				if dlErr := r.dlq.Save(dlEntry); dlErr != nil {
 					logger.Error("saving dead letter", "error", dlErr)
 				}
 			} else {
+				r.Stats.DeliveriesSucceeded.Add(1)
 				logger.Info("delivery succeeded", "destination", dest.URL)
 			}
 		}()
